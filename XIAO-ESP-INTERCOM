@@ -1,0 +1,183 @@
+substitutions:
+  name: xiao-intercom-1
+  friendly_name: XIAO Intercom 1
+  # Shared Single-Bus I2S Pins on XIAO ESP32-S3
+  i2s_bclk_pin: GPIO1   # XIAO D0 -> Mic SCK & Amp BCLK
+  i2s_lrclk_pin: GPIO2  # XIAO D1 -> Mic WS & Amp LRC
+  i2s_din_pin: GPIO3    # XIAO D2 -> Mic SD
+  i2s_dout_pin: GPIO4   # XIAO D3 -> Amp DIN
+
+# Exact 4 packages from your working build
+packages:
+  call_settings: github://n-IA-hane/esphome-intercom/packages/voip/call_settings.yaml@main
+  voip_transport: github://n-IA-hane/esphome-intercom/packages/voip/transport.yaml@main
+  audio_stack_controls: github://n-IA-hane/esphome-intercom/packages/esp_audio_stack/controls.yaml@main
+  aec_controls: github://n-IA-hane/esphome-intercom/packages/esp_audio_stack/aec_controls.yaml@main
+
+esphome:
+  min_version: 2026.9.0
+  name: ${name}
+  friendly_name: ${friendly_name}
+  platformio_options:
+    board_build.flash_mode: dio
+
+esp32:
+  board: seeed_xiao_esp32s3
+  variant: esp32s3
+  flash_size: 8MB
+  framework:
+    type: esp-idf
+    advanced:
+      compiler_optimization: PERF
+    sdkconfig_options:
+      CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: "y"
+      CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG: "y"
+      CONFIG_ESP_CONSOLE_SECONDARY_NONE: "y"
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+preferences:
+  flash_write_interval: 5min
+
+external_components:
+  - source: github://n-IA-hane/esphome-audio-stack@main
+    components: [esp_audio_stack, esp_aec]
+  - source: github://n-IA-hane/esphome-voip-stack@main
+    components: [voip_stack]
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: NONE
+
+api:
+  custom_services: true
+
+ota:
+  - platform: esphome
+
+logger:
+  hardware_uart: USB_SERIAL_JTAG
+  level: INFO
+
+# =============================================================================
+# FULL-DUPLEX AUDIO STACK + SOFTWARE ECHO CANCELLATION (ESP-AEC)
+# =============================================================================
+esp_audio_stack:
+  task_core: 1
+  i2s_bclk_pin: ${i2s_bclk_pin}
+  i2s_lrclk_pin: ${i2s_lrclk_pin}
+  i2s_din_pin: ${i2s_din_pin}
+  i2s_dout_pin: ${i2s_dout_pin}
+  sample_rate: 16000
+  output_sample_rate: 16000
+  bits_per_sample: 32
+  slot_bit_width: 32
+  rx_slot_mode: stereo
+  mic_channel: left
+  correct_dc_offset: true
+  processor_id: aec_processor
+  aec_reference: previous_frame
+  buffers_in_psram: true
+
+esp_aec:
+  id: aec_processor
+  sample_rate: 16000
+  filter_length: 4
+  mode: fd_high_perf
+
+microphone:
+  - platform: esp_audio_stack
+    id: mic_main
+
+speaker:
+  - platform: esp_audio_stack
+    id: hw_speaker
+
+# =============================================================================
+# VOIP STACK SIP ENDPOINT
+# =============================================================================
+voip_stack:
+  id: phone
+  use_ha_as_first_contact: true
+  task_stacks_in_psram: true
+  signaling_buffers_in_psram: true
+  buffers_in_psram: true
+  microphone: mic_main
+  speaker: hw_speaker
+  audio:
+    tx: { sample_rate: 16000, pcm_format: s16le, channels: 1, frame_ms: 20 }
+    rx: { sample_rate: 16000, pcm_format: s16le, channels: 1, frame_ms: 20 }
+
+# =============================================================================
+# PHYSICAL BUTTON & DASHBOARD CALL CONTROLS
+# =============================================================================
+button:
+  - platform: template
+    name: "Call Selected Contact / Hangup"
+    on_press:
+      - voip_stack.call_toggle:
+
+  - platform: template
+    name: "Answer Incoming Call"
+    on_press:
+      - voip_stack.answer_call:
+
+  - platform: template
+    name: "Next Contact in Phonebook"
+    on_press:
+      - voip_stack.next_contact:
+# Add this inside your existing button: section!
+  - platform: template
+    name: "Test Speaker Max Volume Beep"
+    on_press:
+      - lambda: |-
+          // Generates 0.5 seconds of 100% full-scale 1000Hz tone at 16kHz sample rate
+          // (16-bit signed PCM: 8 samples high, 8 samples low per cycle)
+          std::vector<uint8_t> tone;
+          tone.reserve(16000); // 8000 samples * 2 bytes = 0.5 sec
+          for (int i = 0; i < 500; i++) {
+            for (int h = 0; h < 8; h++) {
+              tone.push_back(0xFF); // +30000 (Near max 16-bit amplitude)
+              tone.push_back(0x75);
+            }
+            for (int l = 0; l < 8; l++) {
+              tone.push_back(0x00); // -30000
+              tone.push_back(0x8B);
+            }
+          }
+          id(hw_speaker).play(tone.data(), tone.size());
+
+  # Add this inside your existing button: section on XIAO Intercom 1
+  - platform: template
+    name: "Play Doorbell Chime"
+    id: doorbell_chime_btn
+    on_press:
+      - lambda: |-
+          // Generates a two-tone "Ding-Dong" (660Hz then 550Hz) at 16kHz sample rate
+          std::vector<uint8_t> chime;
+          chime.reserve(24000); // ~0.75 seconds total
+          // "DING" (~660 Hz for 0.35s)
+          for (int i = 0; i < 230; i++) {
+            for (int h = 0; h < 12; h++) { chime.push_back(0xFF); chime.push_back(0x65); }
+            for (int l = 0; l < 12; l++) { chime.push_back(0x00); chime.push_back(0x9B); }
+          }
+          // "DONG" (~500 Hz for 0.4s)
+          for (int i = 0; i < 200; i++) {
+            for (int h = 0; h < 16; h++) { chime.push_back(0xFF); chime.push_back(0x65); }
+            for (int l = 0; l < 16; l++) { chime.push_back(0x00); chime.push_back(0x9B); }
+          }
+          id(hw_speaker).play(chime.data(), chime.size());
+# Physical button on D6 (GPIO43) to GND
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO43
+      mode:
+        input: true
+        pullup: true
+    name: "Intercom Push Button"
+    on_press:
+      - voip_stack.call_toggle:
